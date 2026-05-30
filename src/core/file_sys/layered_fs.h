@@ -13,6 +13,7 @@
 #include <boost/serialization/export.hpp>
 #include <boost/serialization/shared_ptr.hpp>
 #include <boost/serialization/string.hpp>
+#include <boost/serialization/version.hpp>
 #include "common/common_types.h"
 #include "common/swap.h"
 #include "core/file_sys/romfs_reader.h"
@@ -41,11 +42,14 @@ static_assert(sizeof(RomFSHeader) == 0x28, "Size of RomFSHeader is not correct")
  * patch_ext_path: Path for RomFS extensions. Files present in this path:
  *  - When with an extension of ".stub", remove the corresponding file in the RomFS.
  *  - When with an extension of ".ips" or ".bps", patch the file in the RomFS.
+ * patch_garc_path: Path for raw GARC member overrides. Files present under this path use the
+ *  same path as the target GARC, with a decimal member id as the final path component.
  */
 class LayeredFS : public RomFSReader {
 public:
     explicit LayeredFS(std::shared_ptr<RomFSReader> romfs, std::string patch_path,
-                       std::string patch_ext_path, bool load_relocations = true);
+                       std::string patch_ext_path, bool load_relocations = true,
+                       std::string patch_garc_path = "");
     ~LayeredFS() override;
 
     std::size_t GetSize() const override;
@@ -84,8 +88,13 @@ private:
     // Load replace/create relocations
     void LoadRelocations();
 
+    // Load in-memory GARC member override relocations
+    void LoadGarcRelocations();
+
     // Load patch/remove relocations
     void LoadExtRelocations();
+
+    bool ReadCurrentFileData(File& file, std::vector<u8>& out);
 
     // Calculate the offset of a single directory add it to the map and list of directories
     void PrepareBuildDirectory(Directory& current);
@@ -111,6 +120,7 @@ private:
     std::shared_ptr<RomFSReader> romfs;
     std::string patch_path;
     std::string patch_ext_path;
+    std::string patch_garc_path;
     bool load_relocations;
 
     RomFSHeader header;
@@ -139,11 +149,16 @@ private:
     LayeredFS();
 
     template <class Archive>
-    void serialize(Archive& ar, const unsigned int) {
+    void serialize(Archive& ar, const unsigned int file_version) {
         ar& boost::serialization::base_object<RomFSReader>(*this);
         ar & romfs;
         ar & patch_path;
         ar & patch_ext_path;
+        if (file_version >= 1) {
+            ar & patch_garc_path;
+        } else if (Archive::is_loading::value) {
+            patch_garc_path.clear();
+        }
         ar & load_relocations;
         if (Archive::is_loading::value) {
             Load();
@@ -156,3 +171,4 @@ private:
 } // namespace FileSys
 
 BOOST_CLASS_EXPORT_KEY(FileSys::LayeredFS)
+BOOST_CLASS_VERSION(FileSys::LayeredFS, 1)

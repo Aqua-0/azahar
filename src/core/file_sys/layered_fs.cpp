@@ -3,7 +3,10 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
+#include <limits>
+#include <system_error>
 #include "common/alignment.h"
 #include "common/archives.h"
 #include "common/assert.h"
@@ -11,6 +14,7 @@
 #include "common/file_util.h"
 #include "common/string_util.h"
 #include "common/swap.h"
+#include "core/file_sys/garc_patch.h"
 #include "core/file_sys/layered_fs.h"
 #include "core/file_sys/patch.h"
 
@@ -31,6 +35,68 @@ struct LayeredFS::File {
     FileRelocationInfo relocation{};
     Directory* parent;
 };
+
+namespace {
+
+std::string TrimTrailingSeparators(std::string path) {
+    while (!path.empty() && (path.back() == '/' || path.back() == '\\')) {
+        path.pop_back();
+    }
+    return path;
+}
+
+bool ParseDecimalU32(const std::string& text, u32& out) {
+    if (text.empty()) {
+        return false;
+    }
+
+    u64 parsed{};
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    const auto result = std::from_chars(begin, end, parsed, 10);
+    if (result.ec != std::errc{} || result.ptr != end ||
+        parsed > std::numeric_limits<u32>::max()) {
+        return false;
+    }
+
+    out = static_cast<u32>(parsed);
+    return true;
+}
+
+bool ReadHostFile(const std::string& path, std::vector<u8>& out) {
+    FileUtil::IOFile file(path, "rb");
+    if (!file) {
+        return false;
+    }
+
+    const u64 size = file.GetSize();
+    if (size > std::numeric_limits<std::size_t>::max()) {
+        return false;
+    }
+
+    out.resize(static_cast<std::size_t>(size));
+    if (out.empty()) {
+        return true;
+    }
+    return file.ReadBytes(out.data(), out.size()) == out.size();
+}
+
+bool SplitGarcMemberOverridePath(const std::string& path, std::string& garc_path, u32& member_id) {
+    const std::size_t last_separator = path.find_last_of("/\\");
+    if (last_separator == std::string::npos || last_separator == 0 ||
+        last_separator + 1 >= path.size()) {
+        return false;
+    }
+
+    if (!ParseDecimalU32(path.substr(last_separator + 1), member_id)) {
+        return false;
+    }
+
+    garc_path = path.substr(0, last_separator);
+    return true;
+}
+
+} // namespace
 
 struct DirectoryMetadata {
     u32_le parent_directory_offset;
@@ -57,9 +123,11 @@ static_assert(sizeof(FileMetadata) == 0x20, "Size of FileMetadata is not correct
 LayeredFS::LayeredFS() = default;
 
 LayeredFS::LayeredFS(std::shared_ptr<RomFSReader> romfs_, std::string patch_path_,
-                     std::string patch_ext_path_, bool load_relocations_)
+                     std::string patch_ext_path_, bool load_relocations_,
+                     std::string patch_garc_path_)
     : romfs(std::move(romfs_)), patch_path(std::move(patch_path_)),
-      patch_ext_path(std::move(patch_ext_path_)), load_relocations(load_relocations_) {
+      patch_ext_path(std::move(patch_ext_path_)), patch_garc_path(std::move(patch_garc_path_)),
+      load_relocations(load_relocations_) {
     Load();
 }
 
@@ -74,6 +142,7 @@ void LayeredFS::Load() {
 
     if (load_relocations) {
         LoadRelocations();
+        LoadGarcRelocations();
         LoadExtRelocations();
     }
 
@@ -187,6 +256,116 @@ void LayeredFS::LoadRelocations() {
     FileUtil::ForeachDirectoryEntry(nullptr, patch_path, callback);
 }
 
+bool LayeredFS::ReadCurrentFileData(File& file, std::vector<u8>& out) {
+    if (file.relocation.size > std::numeric_limits<std::size_t>::max()) {
+        LOG_ERROR(Service_FS, "LayeredFS file {} is too large to read into memory", file.path);
+        return false;
+    }
+
+    const auto size = static_cast<std::size_t>(file.relocation.size);
+    out.clear();
+
+    if (file.relocation.type == 0) { // none
+        out.resize(size);
+        if (out.empty()) {
+            return true;
+        }
+        return romfs->ReadFile(file.relocation.original_offset, out.size(), out.data()) ==
+               out.size();
+    }
+
+    if (file.relocation.type == 1) { // replace
+        return ReadHostFile(file.relocation.replace_file_path, out);
+    }
+
+    if (file.relocation.type == 2) { // patch
+        out = file.relocation.patched_file;
+        return true;
+    }
+
+    return false;
+}
+
+void LayeredFS::LoadGarcRelocations() {
+    if (patch_garc_path.empty() || !FileUtil::Exists(patch_garc_path)) {
+        return;
+    }
+
+    const std::string scan_root = TrimTrailingSeparators(patch_garc_path);
+    if (scan_root.empty()) {
+        return;
+    }
+
+    FileUtil::FSTEntry result;
+    FileUtil::ScanDirectoryTree(scan_root, result, 256);
+
+    std::vector<FileUtil::FSTEntry> files;
+    FileUtil::GetAllFilesFromNestedEntries(result, files);
+
+    std::map<std::string, GarcPatch::MemberOverrideMap> overrides_by_garc;
+    for (const auto& entry : files) {
+        if (entry.physicalName.size() <= scan_root.size()) {
+            LOG_WARNING(Service_FS, "LayeredFS ignored malformed GARC member override {}",
+                        entry.physicalName);
+            continue;
+        }
+
+        const std::string override_path = entry.physicalName.substr(scan_root.size());
+        std::string garc_path;
+        u32 member_id{};
+        if (!SplitGarcMemberOverridePath(override_path, garc_path, member_id)) {
+            LOG_WARNING(Service_FS, "LayeredFS ignored malformed GARC member override {}",
+                        override_path);
+            continue;
+        }
+
+        std::vector<u8> override_bytes;
+        if (!ReadHostFile(entry.physicalName, override_bytes)) {
+            LOG_ERROR(Service_FS, "LayeredFS could not read GARC member override {}",
+                      entry.physicalName);
+            continue;
+        }
+
+        auto& member_overrides = overrides_by_garc[garc_path];
+        if (member_overrides.count(member_id)) {
+            LOG_WARNING(Service_FS, "LayeredFS duplicate GARC override for {} member {}",
+                        garc_path, member_id);
+        }
+        member_overrides[member_id] = std::move(override_bytes);
+    }
+
+    for (auto& [garc_path, member_overrides] : overrides_by_garc) {
+        if (!file_path_map.count(garc_path)) {
+            LOG_WARNING(Service_FS, "LayeredFS target GARC for member overrides not found: {}",
+                        garc_path);
+            continue;
+        }
+
+        auto& file = *file_path_map.at(garc_path);
+        std::vector<u8> garc_bytes;
+        if (!ReadCurrentFileData(file, garc_bytes)) {
+            LOG_ERROR(Service_FS, "LayeredFS could not read target GARC for member overrides: {}",
+                      garc_path);
+            continue;
+        }
+
+        std::vector<u8> patched_garc;
+        std::string error;
+        const auto ret = GarcPatch::RepackDefaultLanguageMembers(garc_bytes, member_overrides,
+                                                                 patched_garc, &error);
+        if (ret != Loader::ResultStatus::Success) {
+            LOG_ERROR(Service_FS, "LayeredFS failed to patch GARC {}: {}", garc_path, error);
+            continue;
+        }
+
+        file.relocation.type = 2;
+        file.relocation.size = patched_garc.size();
+        file.relocation.patched_file = std::move(patched_garc);
+        LOG_INFO(Service_FS, "LayeredFS patched GARC {} with {} raw member override(s)",
+                 garc_path, member_overrides.size());
+    }
+}
+
 void LayeredFS::LoadExtRelocations() {
     if (!FileUtil::Exists(patch_ext_path)) {
         return;
@@ -244,8 +423,11 @@ void LayeredFS::LoadExtRelocations() {
             }
 
             auto& file = *file_path_map[file_path];
-            std::vector<u8> buffer(file.relocation.size); // Original size
-            romfs->ReadFile(file.relocation.original_offset, buffer.size(), buffer.data());
+            std::vector<u8> buffer;
+            if (!ReadCurrentFileData(file, buffer)) {
+                LOG_ERROR(Service_FS, "LayeredFS Could not read file {}", file_path);
+                continue;
+            }
 
             Loader::ResultStatus ret{};
             if (extension == ".ips") {

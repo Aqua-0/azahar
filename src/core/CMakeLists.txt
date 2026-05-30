@@ -79,6 +79,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     file_sys/delay_generator.h
     file_sys/ivfc_archive.cpp
     file_sys/ivfc_archive.h
+    file_sys/garc_patch.cpp
+    file_sys/garc_patch.h
     file_sys/layered_fs.cpp
     file_sys/layered_fs.h
     file_sys/ncch_container.cpp

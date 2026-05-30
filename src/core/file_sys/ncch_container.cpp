@@ -651,10 +651,12 @@ Loader::ResultStatus NCCHContainer::ReadRomFS(std::shared_ptr<RomFSReader>& romf
         fmt::format("{}mods/{:016X}/", FileUtil::GetUserPath(FileUtil::UserPath::LoadDir),
                     GetModId(ncch_header.program_id));
     if (!is_proto && use_layered_fs &&
-        (FileUtil::Exists(path + "romfs/") || FileUtil::Exists(path + "romfs_ext/"))) {
+        (FileUtil::Exists(path + "romfs/") || FileUtil::Exists(path + "romfs_ext/") ||
+         FileUtil::Exists(path + "romfs_garc/"))) {
 
         romfs_file = std::make_shared<LayeredFS>(std::move(direct_romfs), path + "romfs/",
-                                                 path + "romfs_ext/");
+                                                 path + "romfs_ext/", true,
+                                                 path + "romfs_garc/");
     } else {
         romfs_file = std::move(direct_romfs);
     }
